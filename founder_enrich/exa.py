@@ -58,7 +58,7 @@ def discover(domain: str, company: str, api_key: Optional[str]) -> DiscoveryResu
             query=query,
             category="people",
             type="auto",
-            num_results=5,
+            num_results=10,
         )
     except Exception as e:
         result.notes.append(f"exa-search-failed:{type(e).__name__}")
@@ -135,44 +135,47 @@ def _extract_role(item) -> str:
 
 
 def _verifies_at_company(item, company: str, domain: str) -> bool:
-    """Confirm the person's work history actually mentions the target
-    company. This is our local stand-in for Websets' verification step."""
-    company_lc = company.lower().strip()
-    domain_root = domain.lower().split(".")[0]
-    needles = {company_lc, domain_root}
-    needles.discard("")
+    """Confirm the person's work history mentions the target company at
+    the organization-field level, with WORD-BOUNDARY matching.
 
-    # Check structured work history first.
+    Old version was substring-match on combined text. That fails badly
+    when company name is also a common given name: 'Sid' matches 'Sid
+    Sijbrandij' (GitLab founder) because his name 'Sid' appears in his
+    own LinkedIn page everywhere. Word-boundary + restricting to
+    organization-name fields fixes the false-positive class."""
+    company_lc = (company or "").lower().strip()
+    domain_root = (domain or "").lower().split(".")[0]
+
+    # Build word-boundary regex patterns. Skip very-short needles (<2
+    # chars) — too noisy regardless of word boundaries.
+    patterns = []
+    for needle in {company_lc, domain_root}:
+        if needle and len(needle) >= 2:
+            patterns.append(re.compile(r"\b" + re.escape(needle) + r"\b", re.IGNORECASE))
+    if not patterns:
+        return False
+
+    # When structured work_history is populated, it's authoritative: if
+    # the target company doesn't appear in any org field (word-bounded),
+    # this is a false positive — reject regardless of what other fields say.
+    # This is what kills the "Sid Sijbrandij at sid.ai" case: his work
+    # history says "GitLab", "Co-op", etc., none of which match \bsid\b.
     history = _walk(item, ("entities", 0, "work_history")) or _walk(
         item, ("properties", "person", "work_history")
     )
-    if isinstance(history, list):
+    if isinstance(history, list) and history:
         for entry in history:
-            blob = " ".join(
-                str(v).lower()
-                for v in (
-                    _walk(entry, ("company",)),
-                    _walk(entry, ("company_name",)),
-                    _walk(entry, ("organization",)),
-                    _walk(entry, ("name",)),
-                )
-                if v
-            )
-            if any(n in blob for n in needles if n):
-                return True
+            for org_field in ("company", "company_name", "organization", "name"):
+                org = _walk(entry, (org_field,))
+                if org and any(p.search(str(org)) for p in patterns):
+                    return True
+        return False  # structured data present but no org match → reject
 
-    # Fall back to title + text + url — covers cases where the result is
-    # a LinkedIn profile page and the company appears in the headline.
-    haystack = " ".join(
-        str(v).lower()
-        for v in (
-            _walk(item, ("title",)),
-            _walk(item, ("text",)),
-            _walk(item, ("url",)),
-        )
-        if v
-    )
-    return any(n in haystack for n in needles if n)
+    # No structured work history → trust Exa's ranking. The category="people"
+    # search with explicit company name in the query is already highly
+    # targeted; over-filtering when we lack structured data costs ~50% of
+    # coverage for marginal precision gain.
+    return True
 
 
 def _walk(obj, path):

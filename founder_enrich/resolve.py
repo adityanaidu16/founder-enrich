@@ -19,6 +19,14 @@ except ImportError:  # pragma: no cover - optional, falls back gracefully
     _HAS_DNS = False
 
 
+# Stripped off the front of names before splitting. Without this, "Dr.
+# Richard Carback" would split to first="Dr.", last="Richard Carback".
+HONORIFICS = {
+    "dr", "dr.", "mr", "mr.", "mrs", "mrs.", "ms", "ms.",
+    "prof", "prof.", "sir", "madam", "miss", "rev", "rev.",
+}
+
+
 # Patterns ordered by empirical frequency at small startups (Google Workspace
 # heavy). The first one is the most common single bet; the full list is the
 # fallback when we have nothing better.
@@ -53,6 +61,9 @@ def split_name(full_name: str) -> Optional[tuple]:
     ascii_only = "".join(c for c in normalized if not unicodedata.combining(c))
     ascii_only = re.sub(r"[^A-Za-z\s\-']", "", ascii_only)
     parts = [p for p in ascii_only.split() if p]
+    # Drop leading honorifics ("Dr.", "Prof.", etc.)
+    while parts and parts[0].lower().strip(",.") in HONORIFICS:
+        parts.pop(0)
     # Drop common particles when computing the surname.
     particles = {"de", "la", "van", "von", "del", "der", "du", "le", "el"}
     significant = [p for p in parts if p.lower() not in particles]

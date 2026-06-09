@@ -117,6 +117,14 @@ def _clean_domain(raw: str) -> str:
     raw = (raw or "").strip().lower()
     if not raw:
         return ""
+    # CRM exports often put multiple domains in a single cell:
+    # "unkey.dev,unkey.com" or "foo.com; bar.com". Take only the first
+    # — without this we'd produce literal-broken emails like
+    # "james@unkey.dev,unkey.com".
+    for sep in (",", ";"):
+        if sep in raw:
+            raw = raw.split(sep, 1)[0].strip()
+            break
     if "://" in raw:
         raw = urlparse(raw).netloc or urlparse(raw).path
     raw = raw.split("/")[0]

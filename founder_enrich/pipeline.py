@@ -11,6 +11,7 @@ Discovery cascade:
 from __future__ import annotations
 
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
@@ -69,6 +70,23 @@ def enrich_row(
         exa_api_key=exa_api_key,
     )
 
+    # Clean (strip honorifics) and reject obvious garbage (single-letter
+    # first names, company-name-as-person matches like "Plakar Korp").
+    cleaned_founders = []
+    seen_names: set = set()
+    for f in disc.founders:
+        cf = _clean_and_validate(f, company, clean)
+        if cf is None:
+            continue
+        # Dedup on normalized name — Exa sometimes returns the same person
+        # twice via different URLs (e.g., LinkedIn + their personal site).
+        key = re.sub(r"[^a-z]", "", cf.name.lower())
+        if key in seen_names:
+            continue
+        seen_names.add(key)
+        cleaned_founders.append(cf)
+    disc.founders = cleaned_founders
+
     if not disc.founders:
         out.notes = "; ".join(disc.notes) or "no-founders-found"
         return out
@@ -78,70 +96,151 @@ def enrich_row(
 
     pattern = _infer_pattern(disc.anchor_emails, disc.founders)
 
-    # Pre-compute primary emails for every founder so we can populate
-    # all_founders/all_emails on whichever row we ultimately return.
-    secondary_founders: List[str] = []
-    secondary_emails: List[str] = []
-    for f in disc.founders[1:MAX_FOUNDERS]:
-        f_cands = resolve.candidates_for(f.name, clean, pattern)
-        if not f_cands:
+    # Compute emails with collision detection: when two founders share a
+    # first name (e.g. three Sids at sid.ai), the second one falls through
+    # to {first}.{last}@ so we don't emit three rows pointing to the
+    # same mailbox.
+    used_emails: set = set()
+    slotted = []  # list of (Founder, chosen_candidate, all_candidates)
+    for f in disc.founders[:MAX_FOUNDERS]:
+        cands = resolve.candidates_for(f.name, clean, pattern)
+        chosen = next((c for c in cands if c.email not in used_emails), None)
+        if chosen is None:
             continue
-        secondary_founders.append(f.name)
-        secondary_emails.append(f_cands[0].email)
+        used_emails.add(chosen.email)
+        slotted.append((f, chosen, cands))
 
-    best: Optional[RowResult] = None
-    for founder in disc.founders[:5]:
-        cands = resolve.candidates_for(founder.name, clean, pattern)
-        if not cands:
-            continue
-        row = RowResult(
-            company=company,
-            domain=domain,
-            founder_name=founder.name,
-            source=founder.source,
-            mx_provider=mx.provider,
-        )
-        row.alternates = [c.email for c in cands]
-        row.all_founders = list(secondary_founders)
-        row.all_emails = list(secondary_emails)
+    if not slotted:
+        out.notes = "; ".join(disc.notes) or "no-emails-derivable"
+        return out
 
-        if do_smtp:
-            v = verify.verify(cands[0].email, mx.hosts)
-            row.email = cands[0].email
-            row.notes = v.reason
-            if v.deliverable is True and not v.catch_all:
-                row.confidence = HIGH
-            elif v.catch_all and pattern:
-                row.confidence = MED
-            elif v.catch_all:
-                row.confidence = LOW
-            elif v.deliverable is False:
-                row.confidence = NONE
-                for alt in cands[1:]:
-                    v2 = verify.verify(alt.email, mx.hosts)
-                    if v2.deliverable is True and not v2.catch_all:
-                        row.email = alt.email
-                        row.confidence = HIGH
-                        row.notes = v2.reason
-                        break
-            else:
-                row.confidence = MED if pattern else LOW
-        else:
-            row.email = cands[0].email
-            row.confidence = MED if pattern else LOW
-            row.notes = "smtp-skipped"
+    primary_founder, primary_chosen, primary_cands = slotted[0]
+    secondary_founders = [f.name for f, _, _ in slotted[1:]]
+    secondary_emails = [c.email for _, c, _ in slotted[1:]]
 
-        # Exa-sourced founders are pre-verified against work history, so
-        # treat them as at least medium even when SMTP can't confirm.
-        if founder.source.startswith("exa:") and row.confidence == LOW:
+    row = RowResult(
+        company=company,
+        domain=domain,
+        founder_name=primary_founder.name,
+        email=primary_chosen.email,
+        source=primary_founder.source,
+        mx_provider=mx.provider,
+        alternates=[c.email for c in primary_cands],
+        all_founders=secondary_founders,
+        all_emails=secondary_emails,
+    )
+
+    if do_smtp:
+        v = verify.verify(primary_chosen.email, mx.hosts)
+        row.notes = v.reason
+        if v.deliverable is True and not v.catch_all:
+            row.confidence = HIGH
+        elif v.catch_all and pattern:
             row.confidence = MED
+        elif v.catch_all:
+            row.confidence = LOW
+        elif v.deliverable is False:
+            row.confidence = NONE
+            for alt in primary_cands[1:]:
+                if alt.email in used_emails - {primary_chosen.email}:
+                    continue  # skip patterns already used by other slots
+                v2 = verify.verify(alt.email, mx.hosts)
+                if v2.deliverable is True and not v2.catch_all:
+                    row.email = alt.email
+                    row.confidence = HIGH
+                    row.notes = v2.reason
+                    break
+        else:
+            row.confidence = MED if pattern else LOW
+    else:
+        row.confidence = MED if pattern else LOW
+        row.notes = "smtp-skipped"
 
-        if row.confidence == HIGH:
-            return row
-        if best is None or _rank(row.confidence) > _rank(best.confidence):
-            best = row
+    # Exa-sourced founders are pre-verified against work history, so
+    # treat them as at least medium even when SMTP can't confirm.
+    if primary_founder.source.startswith("exa:") and row.confidence == LOW:
+        row.confidence = MED
 
-    return best or out
+    return row
+
+
+# Honorifics + corporate suffixes used by the validator below. Kept here
+# rather than in resolve.py because the validator needs the full set for
+# rejection decisions, not just the lowercased email-derivation set.
+_HONORIFICS_ALL = {
+    "dr", "dr.", "mr", "mr.", "mrs", "mrs.", "ms", "ms.",
+    "prof", "prof.", "sir", "madam", "miss", "rev", "rev.",
+}
+_COMPANY_SUFFIXES = {
+    "corp", "korp", "inc", "llc", "ltd", "labs", "lab",
+    "gmbh", "ag", "co", "company", "holdings",
+}
+# Common English nouns that surface as fake "last names" when Exa returns
+# product/account pages instead of real people (e.g. "Zo Computer" at
+# morphllm). Real surnames almost never collide with these.
+_NON_SURNAME_WORDS = {
+    "computer", "server", "system", "systems", "solutions", "software",
+    "cloud", "platform", "network", "service", "services", "tech",
+    "technology", "technologies", "research", "studio", "studios",
+    "agency", "team", "support", "engineering", "operations", "security",
+}
+
+
+def _clean_and_validate(
+    f: discover.Founder, company: str, clean_domain: str
+) -> Optional[discover.Founder]:
+    """Strip honorifics, reject garbage names. Returns a new Founder with
+    cleaned name, or None to drop the candidate entirely."""
+    name = (f.name or "").strip()
+    if not name:
+        return None
+    parts = name.split()
+
+    # Strip leading honorifics ("Dr. Richard Carback" → "Richard Carback").
+    while parts and parts[0].lower().strip(",.") in _HONORIFICS_ALL:
+        parts.pop(0)
+    if len(parts) < 2:
+        return None
+
+    first = parts[0]
+    # Reject single-letter first names — these are LinkedIn profiles that
+    # display as initials only ("S Si", "M K"). The resulting "s@" email
+    # is almost never valid.
+    if len(re.sub(r"[^A-Za-z]", "", first)) < 2:
+        return None
+
+    # Reject company-name-as-person matches ("Plakar Korp", "Foo Inc"):
+    # if the domain root appears as a token AND another token is a known
+    # corporate suffix, it's the company branding, not a real person.
+    parts_lc = [p.lower().strip(",.") for p in parts]
+    domain_root = (clean_domain or "").split(".")[0]
+    if domain_root in parts_lc and any(p in _COMPANY_SUFFIXES for p in parts_lc):
+        return None
+
+    # Reject exact name = company match (cleaned of punctuation).
+    cleaned_alpha = re.sub(r"[^a-z]", "", " ".join(parts_lc))
+    cleaned_company = re.sub(r"[^a-z]", "", (company or "").lower())
+    if cleaned_alpha and (cleaned_alpha == cleaned_company or cleaned_alpha == domain_root):
+        return None
+
+    # Reject if EITHER first name OR last name equals the company/domain
+    # token. Catches "Treena Lynch" at treena.app, "Nicola Vigio" at
+    # vigio.io, "Mother Duck" at zettafleet, etc. — Exa sometimes returns
+    # results that look person-shaped but are actually the company's
+    # brand/mascot/eponymous reference.
+    first_lc, last_lc = parts_lc[0], parts_lc[-1]
+    for token_lc in (first_lc, last_lc):
+        if token_lc and (token_lc == cleaned_company or token_lc == domain_root):
+            return None
+
+    # Reject if the "last name" is a common English noun ("Computer",
+    # "Solutions"). These leak in when Exa returns a product or team
+    # page that was parsed as a person.
+    if last_lc in _NON_SURNAME_WORDS:
+        return None
+
+    cleaned_name = " ".join(parts)
+    return discover.Founder(name=cleaned_name, role=f.role, source=f.source)
 
 
 def enrich_rows(
