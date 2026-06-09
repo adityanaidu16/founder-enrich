@@ -40,8 +40,10 @@ class FounderEnrichApp(rumps.App):
             None,
             rumps.MenuItem("Quit", callback=rumps.quit_application),
         ]
-        # Hydrate persisted settings.
-        self._skip_smtp = bool(self._read_config("skip_smtp", False))
+        # SMTP defaults to OFF in v0.3+: it added latency without value
+        # for Google Workspace domains (which return 250 to everything),
+        # which is most of the startup population.
+        self._skip_smtp = bool(self._read_config("skip_smtp", True))
         self.menu["Skip SMTP verification"].state = self._skip_smtp
         self._busy = False
 

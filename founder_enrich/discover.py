@@ -15,7 +15,9 @@ import requests
 from bs4 import BeautifulSoup
 
 UA = "Mozilla/5.0 (compatible; FounderEnrich/0.1; +https://github.com/)"
-TIMEOUT = 10
+# Aggressive timeout: most sites that respond do so in <2s. Long timeouts
+# here used to dominate per-row wall time when sites were slow or dead.
+TIMEOUT = 4
 TEAM_PATHS = (
     "/team", "/about", "/about-us", "/founders", "/leadership",
     "/people", "/our-team", "/company", "/who-we-are",

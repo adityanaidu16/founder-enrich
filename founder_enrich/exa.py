@@ -49,14 +49,16 @@ def discover(domain: str, company: str, api_key: Optional[str]) -> DiscoveryResu
     query = f"founder co-founder {company}"
 
     try:
-        # search_and_contents returns text + structured entities in one call.
-        # category="people" hits Exa's 1B-profile index instead of generic web.
-        response = client.search_and_contents(
+        # Plain search (not search_and_contents) — we only need the people
+        # entities + title/url. Fetching full page text for every result
+        # adds ~10-30s per call without improving extraction quality.
+        # num_results capped low: we sort + filter client-side, more results
+        # just means more verify work for no upside.
+        response = client.search(
             query=query,
             category="people",
             type="auto",
-            num_results=10,
-            text=True,
+            num_results=5,
         )
     except Exception as e:
         result.notes.append(f"exa-search-failed:{type(e).__name__}")

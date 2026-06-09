@@ -26,8 +26,9 @@ def main(argv=None) -> int:
     parser.add_argument("-o", "--output", help="output CSV path (default: <input>_enriched.csv)")
     parser.add_argument("--company-col", default="company")
     parser.add_argument("--domain-col", default="domain")
-    parser.add_argument("--no-smtp", action="store_true",
-                        help="skip SMTP verification (faster; lower confidence)")
+    parser.add_argument("--smtp", action="store_true",
+                        help="run SMTP RCPT TO verification (slower; "
+                             "rarely useful for Google Workspace domains)")
     parser.add_argument("--workers", type=int, default=5)
     args = parser.parse_args(argv)
 
@@ -68,7 +69,7 @@ def main(argv=None) -> int:
         company_col=args.company_col,
         domain_col=args.domain_col,
         exa_api_key=exa_key,
-        do_smtp=not args.no_smtp,
+        do_smtp=args.smtp,
         max_workers=args.workers,
         on_progress=progress,
     )
