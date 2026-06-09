@@ -1,0 +1,58 @@
+name: Release FounderEnrich
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install py2app setuptools
+
+      - name: Build .app
+        run: |
+          python setup.py py2app
+          ls -la dist/
+
+      - name: Zip .app
+        run: |
+          cd dist
+          zip -r FounderEnrich-macos.zip FounderEnrich.app
+
+      - name: Upload artifact (for manual runs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: FounderEnrich-macos
+          path: dist/FounderEnrich-macos.zip
+
+      - name: Attach to Release (for tag pushes)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/FounderEnrich-macos.zip
+          body: |
+            ## Install
+            1. Download `FounderEnrich-macos.zip`, unzip, drag **FounderEnrich.app** to Applications.
+            2. **First launch:** right-click the app → Open → confirm.
+               (macOS blocks unsigned apps from a normal double-click.)
+            3. The ✉︎ icon appears in your menu bar. Click → **Enrich CSV…**
+
+            ## One-time setup
+            Click ✉︎ → **Set Exa API key…** and paste a key from
+            <https://dashboard.exa.ai> (free, 1000 searches/month).

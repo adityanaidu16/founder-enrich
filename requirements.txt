@@ -1,0 +1,5 @@
+requests>=2.31
+beautifulsoup4>=4.12
+dnspython>=2.6
+exa-py>=1.0
+rumps>=0.4 ; sys_platform == "darwin"

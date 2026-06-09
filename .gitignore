@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+*.tmp
+
+# py2app build artifacts
+build/
+dist/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# Local enriched outputs (in case anyone tests in the repo dir)
+*_enriched.csv
