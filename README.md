@@ -10,14 +10,20 @@ searches/month) for verified founders, optional SMTP check for
 deliverability. No hosted services, no shared state — everything runs on the
 teammate's Mac.
 
-## For teammates (no terminal)
+## For teammates
 
 1. Download `FounderEnrich-macos.zip` from
-   [Releases](../../releases?q=enricher) → unzip → drag **FounderEnrich.app**
+   [Releases](../../releases) → unzip → drag **FounderEnrich.app**
    to your **Applications** folder.
-2. **First launch only**: right-click the app → **Open** → confirm. macOS
-   blocks unsigned apps from a normal double-click; after the first time it
-   opens like any other app.
+2. **One-time Gatekeeper bypass.** The app isn't signed with an Apple
+   Developer cert ($99/yr), so modern macOS blocks it on first launch.
+   Open **Terminal** and run:
+   ```bash
+   xattr -dr com.apple.quarantine /Applications/FounderEnrich.app
+   open /Applications/FounderEnrich.app
+   ```
+   This strips the quarantine flag macOS attached when you downloaded the
+   zip. Run it once; the app opens cleanly forever after.
 3. The ✉︎ icon appears in your menu bar. Click → **Enrich CSV…** → pick your
    file. The enriched copy is saved next to the original as
    `<filename>_enriched.csv` and Finder pops open to reveal it.
