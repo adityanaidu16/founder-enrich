@@ -123,20 +123,13 @@ def discover(domain: str, company: str, api_key: Optional[str]) -> DiscoveryResu
             Founder(name=name, role=role or "founder", source=f"exa:{_safe_id(r)}")
         )
 
-    # Fallback: plain web-search against LinkedIn profile URLs. Runs
-    # ONLY when Stage 1 didn't resolve a canonical company entity for
-    # this domain (i.e., the company is too new / not yet indexed).
-    #
-    # If Stage 1 *did* find a canonical entity but no people linked to
-    # it, the fallback would be guessing — name-based LinkedIn matching
-    # cannot disambiguate "Bagel" (bagel.com tech startup) from
-    # "Bagel App" / "Bagel Inc" / etc. that may happen to be on
-    # LinkedIn. Honest empty > wrong founders. The previous version
-    # tried to fall back here and shipped wrong-company founders.
-    if not matches and not canonical_id and not canonical_name:
-        matches = _search_fallback(client, domain, company)
-        if matches:
-            result.notes.append("exa-fallback-used")
+    # Removed in v0.3.7: a LinkedIn-search fallback used to run here
+    # when canonical verification produced no matches. It returned
+    # wrong-company founders for ambiguous names (Bagel, Cinch, etc.)
+    # because name-based matching cannot disambiguate "Cinch" the
+    # database from "Cinch" the insurance company from "Cinch" the
+    # dating app — they all match "Founder at Cinch" titles. Empty is
+    # the honest answer when canonical verification can't confirm.
 
     if not matches:
         result.notes.append("exa-no-verified-matches")
@@ -146,83 +139,6 @@ def discover(domain: str, company: str, api_key: Optional[str]) -> DiscoveryResu
         matches.sort(key=lambda f: 0 if "founder" in f.role.lower() else 1)
         result.founders = matches
     return result
-
-
-# ---------- LinkedIn fallback (used only when canonical verification fails) ----------
-
-
-def _search_fallback(client, domain: str, company: str) -> List[Founder]:
-    """Plain Exa web search restricted to LinkedIn profile URLs.
-
-    Requires a STRICT title pattern: "founder|co-founder|founding ...
-    (at|of|@|,) <company>" with word-boundary match on the company name.
-    Loose substring matching ("founder somewhere + company somewhere in
-    title") produces false positives for common company names — Bagel
-    returns Jeff's Bagel Run, Thicc Bagels, Popup Bagels, etc., which
-    all contain both keywords but are unrelated tech-unrelated bagel
-    businesses, not the bagel.com tech startup.
-
-    The strict pattern keeps Morph's "Tejas Bhakta - Founder at Morph"
-    while rejecting "Adam Goldberg - Founder at Popup Bagels" for Bagel.
-    """
-    domain_root = (domain or "").lower().split(".")[0]
-    company_lc = (company or "").lower().strip()
-    if not domain_root and not company_lc:
-        return []
-
-    query = f'site:linkedin.com/in "founder" {domain_root or company_lc}'
-    try:
-        resp = _safe_search(client, query=query, num_results=10, type="auto")
-    except Exception:
-        return []
-
-    # Build the strict-match pattern. Allow either the company name or
-    # the domain root as the matched token (some titles use one, some
-    # the other). Both must be word-bounded so "Bagel" doesn't match
-    # "Bagels", "Popup Bagels", etc.
-    name_alts = []
-    if company_lc:
-        name_alts.append(re.escape(company_lc))
-    if domain_root and domain_root != company_lc and len(domain_root) >= 3:
-        name_alts.append(re.escape(domain_root))
-    if not name_alts:
-        return []
-    name_alt = "|".join(name_alts)
-
-    # Role keyword + up to ~30 intermediate chars (handles "Founder & CEO
-    # at Acme", "Founding Engineer at Acme") + connector + company.
-    # No '|' in the gap so we don't cross LinkedIn's "Title | LinkedIn"
-    # separator.
-    strict_rx = re.compile(
-        rf"\b(co[-\s]?founder|founder|founding)\b"
-        rf"[^|]{{0,30}}"
-        rf"\b(?:at|of|@|,)\s+"
-        rf"(?:{name_alt})\b",
-        re.IGNORECASE,
-    )
-
-    founders: List[Founder] = []
-    for r in (getattr(resp, "results", None) or []):
-        url = (getattr(r, "url", "") or "")
-        if "linkedin.com/in/" not in url.lower():
-            continue
-
-        title = getattr(r, "title", "") or ""
-        if not strict_rx.search(title):
-            continue
-
-        name = _name_from_profile_title(title)
-        if not name:
-            continue
-
-        # exa-search: prefix (not exa:) — pipeline's confidence-bump
-        # logic for canonically-verified results doesn't apply, so these
-        # stay at low/medium confidence. They're research leads, not
-        # verified founders.
-        founders.append(
-            Founder(name=name, role="founder", source=f"exa-search:{url[:60]}")
-        )
-    return founders
 
 
 # ---------- Stage 1: canonical company ID lookup ----------
@@ -268,26 +184,30 @@ def _verifies(
     item, canonical_id: Optional[str], canonical_name: Optional[str],
     company: str, domain: str,
 ) -> bool:
-    """Layered verification, strongest signal first:
-      1. Canonical ID exact match on work_history.company.id  → accept
-      2. Canonical NAME prefix-match on work_history.company.name → accept
-         (handles same-canonical-company with duplicate Exa IDs)
-      3. Fallback to user-input name+domain word-boundary match
-         (only when Stage 1 found nothing for the domain)"""
-    history = _work_history(item)
+    """Strict verification: only accept if the person's work_history links
+    to the canonical company entity (by ID or by canonical name prefix).
 
-    # 1. Strongest: canonical ID match.
-    if canonical_id and history:
+    No name-based fallback. When Stage 1 returned no canonical (Cinch
+    case — Exa doesn't have cinchdb.dev), we cannot disambiguate which
+    'Cinch' a candidate works at, so we reject. Empty > wrong founders
+    of a same-named different company."""
+    history = _work_history(item)
+    if not history:
+        return False
+
+    # 1. Strongest: canonical ID exact match.
+    if canonical_id:
         for entry in history:
             ref = getattr(entry, "company", None)
             ref_id = getattr(ref, "id", None) if ref else None
             if ref_id and ref_id == canonical_id:
                 return True
 
-    # 2. Canonical name match. Use prefix-match so "Bagel Labs" canonical
-    # matches "Bagel Labs", "Bagel Labs Inc", "Bagel Labs, Inc." — but
-    # NOT "Bagel AI" (different company name = different company).
-    if canonical_name and history:
+    # 2. Canonical NAME prefix-match — handles Exa's duplicate-ID case
+    # where the same canonical company has multiple entity IDs. Prefix
+    # only, so "Bagel Labs" canonical matches "Bagel Labs Inc" but
+    # NOT "Bagel AI".
+    if canonical_name:
         canon_lc = canonical_name.lower().strip()
         for entry in history:
             ref = getattr(entry, "company", None)
@@ -295,41 +215,7 @@ def _verifies(
             if name and str(name).lower().strip().startswith(canon_lc):
                 return True
 
-    # 3. If Stage 1 resolved a canonical company at all, we should NOT
-    # accept on weaker signals — the company exists in Exa but this
-    # person's work history doesn't link to it. Likely a same-name
-    # founder elsewhere (e.g. Bagel AI vs Bagel Labs).
-    if canonical_id or canonical_name:
-        return False
-
-    # 4. No canonical company found (new/stealth domain). Fall back to
-    # word-boundary match against the user's input company name.
-    return _verifies_by_name(item, company, domain)
-
-
-def _verifies_by_name(item, company: str, domain: str) -> bool:
-    """Fallback when no canonical ID. Word-boundary match against
-    work_history.company.name + title."""
-    company_lc = (company or "").lower().strip()
-    domain_root = (domain or "").lower().split(".")[0]
-    patterns = []
-    for needle in {company_lc, domain_root}:
-        if needle and len(needle) >= 2:
-            patterns.append(re.compile(r"\b" + re.escape(needle) + r"\b", re.IGNORECASE))
-    if not patterns:
-        return False
-
-    history = _work_history(item)
-    if history:
-        for entry in history:
-            company_ref = getattr(entry, "company", None) or _walk(entry, ("company",))
-            name = getattr(company_ref, "name", None) or _walk(company_ref, ("name",))
-            if name and any(p.search(str(name)) for p in patterns):
-                return True
-        return False  # structured present but no match → reject
-
-    # No structured work history → trust ranking.
-    return True
+    return False
 
 
 def _work_history(item):

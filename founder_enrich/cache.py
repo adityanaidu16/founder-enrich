@@ -33,7 +33,11 @@ TTL_SECONDS = 30 * 24 * 3600
 #       entries that may have shipped wrong-company founders for short
 #       common-word domains (Bagel) where the strict pattern still
 #       matched unrelated same-name companies.
-SCHEMA_VERSION = 3
+#   v4: v0.3.7 — LinkedIn fallback removed entirely. Even Stage-1-failed
+#       cases (Cinch / cinchdb.dev) were returning founders of unrelated
+#       same-name companies via the fallback. Strict-only now: every
+#       returned founder is canonical-ID/name verified.
+SCHEMA_VERSION = 4
 
 
 def _db_path() -> str:
