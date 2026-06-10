@@ -21,6 +21,16 @@ from founder_enrich.discover import DiscoveryResult, Founder
 
 TTL_SECONDS = 30 * 24 * 3600
 
+# Bump when discovery/validation semantics change. Entries written under
+# an older value are treated as misses on read, so users automatically
+# re-fetch with the new logic instead of holding stale wrong-founder
+# results across upgrades.
+#   v1: pre-versioning (no "schema" field in stored JSON)
+#   v2: v0.3.5 — canonical-ID verification + strict LinkedIn-fallback
+#       pattern. Invalidates v1 entries that had loose name-based matches
+#       like the wrong-bagel-company case.
+SCHEMA_VERSION = 2
+
 
 def _db_path() -> str:
     d = os.path.expanduser("~/Library/Application Support/FounderEnrich")
@@ -60,6 +70,11 @@ def get(domain: str) -> Optional[DiscoveryResult]:
         data = json.loads(result_json)
     except ValueError:
         return None
+    # Schema version check: entries from older versions had different
+    # discovery semantics (e.g. loose Bagel matches) — invalidate so
+    # the caller re-fetches with current logic.
+    if data.get("schema") != SCHEMA_VERSION:
+        return None
     return DiscoveryResult(
         founders=[Founder(**f) for f in data.get("founders", [])],
         anchor_emails=list(data.get("anchor_emails", [])),
@@ -72,6 +87,7 @@ def set(domain: str, result: DiscoveryResult) -> None:
         # Don't cache empty results — let the next run try afresh.
         return
     payload = json.dumps({
+        "schema": SCHEMA_VERSION,
         "founders": [asdict(f) for f in result.founders],
         "anchor_emails": result.anchor_emails,
         "notes": result.notes,
