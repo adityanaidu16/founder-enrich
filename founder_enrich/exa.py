@@ -147,22 +147,54 @@ def discover(domain: str, company: str, api_key: Optional[str]) -> DiscoveryResu
 
 
 def _search_fallback(client, domain: str, company: str) -> List[Founder]:
-    """Plain Exa web search restricted to LinkedIn profile URLs. We accept
-    a result only if (a) URL is a LinkedIn personal profile, (b) title
-    contains a founder role keyword, (c) title references the target
-    company or domain — otherwise we'd accept anyone whose profile body
-    happens to mention the company name."""
+    """Plain Exa web search restricted to LinkedIn profile URLs.
+
+    Requires a STRICT title pattern: "founder|co-founder|founding ...
+    (at|of|@|,) <company>" with word-boundary match on the company name.
+    Loose substring matching ("founder somewhere + company somewhere in
+    title") produces false positives for common company names — Bagel
+    returns Jeff's Bagel Run, Thicc Bagels, Popup Bagels, etc., which
+    all contain both keywords but are unrelated tech-unrelated bagel
+    businesses, not the bagel.com tech startup.
+
+    The strict pattern keeps Morph's "Tejas Bhakta - Founder at Morph"
+    while rejecting "Adam Goldberg - Founder at Popup Bagels" for Bagel.
+    """
     domain_root = (domain or "").lower().split(".")[0]
     company_lc = (company or "").lower().strip()
-    domain_lc = (domain or "").lower().strip()
-    if not domain_root:
+    if not domain_root and not company_lc:
         return []
 
-    query = f'site:linkedin.com/in "founder" {domain_root}'
+    query = f'site:linkedin.com/in "founder" {domain_root or company_lc}'
     try:
         resp = _safe_search(client, query=query, num_results=10, type="auto")
     except Exception:
         return []
+
+    # Build the strict-match pattern. Allow either the company name or
+    # the domain root as the matched token (some titles use one, some
+    # the other). Both must be word-bounded so "Bagel" doesn't match
+    # "Bagels", "Popup Bagels", etc.
+    name_alts = []
+    if company_lc:
+        name_alts.append(re.escape(company_lc))
+    if domain_root and domain_root != company_lc and len(domain_root) >= 3:
+        name_alts.append(re.escape(domain_root))
+    if not name_alts:
+        return []
+    name_alt = "|".join(name_alts)
+
+    # Role keyword + up to ~30 intermediate chars (handles "Founder & CEO
+    # at Acme", "Founding Engineer at Acme") + connector + company.
+    # No '|' in the gap so we don't cross LinkedIn's "Title | LinkedIn"
+    # separator.
+    strict_rx = re.compile(
+        rf"\b(co[-\s]?founder|founder|founding)\b"
+        rf"[^|]{{0,30}}"
+        rf"\b(?:at|of|@|,)\s+"
+        rf"(?:{name_alt})\b",
+        re.IGNORECASE,
+    )
 
     founders: List[Founder] = []
     for r in (getattr(resp, "results", None) or []):
@@ -170,33 +202,18 @@ def _search_fallback(client, domain: str, company: str) -> List[Founder]:
         if "linkedin.com/in/" not in url.lower():
             continue
 
-        title = (getattr(r, "title", "") or "")
-        title_lc = title.lower()
-
-        # Filter (b): title indicates founder role.
-        if not FOUNDER_ROLE_RX.search(title):
-            continue
-
-        # Filter (c): title references the target company. Without this,
-        # any LinkedIn founder whose profile body happens to mention the
-        # company gets accepted (e.g. "Vir S. - Founder at Ravioli" came
-        # back in the morphllm test because their description mentioned it).
-        referenced = (
-            (company_lc and company_lc in title_lc)
-            or (domain_lc and domain_lc in title_lc)
-            or (domain_root and domain_root in title_lc)
-        )
-        if not referenced:
+        title = getattr(r, "title", "") or ""
+        if not strict_rx.search(title):
             continue
 
         name = _name_from_profile_title(title)
         if not name:
             continue
 
-        # exa-search: prefix (NOT exa:) so the pipeline's confidence-bump
-        # logic for canonically-verified results doesn't apply here.
-        # Fallback matches stay at LOW confidence — they're a research
-        # lead rather than a verified founder.
+        # exa-search: prefix (not exa:) — pipeline's confidence-bump
+        # logic for canonically-verified results doesn't apply, so these
+        # stay at low/medium confidence. They're research leads, not
+        # verified founders.
         founders.append(
             Founder(name=name, role="founder", source=f"exa-search:{url[:60]}")
         )
