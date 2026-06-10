@@ -29,7 +29,11 @@ TTL_SECONDS = 30 * 24 * 3600
 #   v2: v0.3.5 — canonical-ID verification + strict LinkedIn-fallback
 #       pattern. Invalidates v1 entries that had loose name-based matches
 #       like the wrong-bagel-company case.
-SCHEMA_VERSION = 2
+#   v3: v0.3.6 — fallback gated on Stage 1 failing. Invalidates v2
+#       entries that may have shipped wrong-company founders for short
+#       common-word domains (Bagel) where the strict pattern still
+#       matched unrelated same-name companies.
+SCHEMA_VERSION = 3
 
 
 def _db_path() -> str:

@@ -123,12 +123,17 @@ def discover(domain: str, company: str, api_key: Optional[str]) -> DiscoveryResu
             Founder(name=name, role=role or "founder", source=f"exa:{_safe_id(r)}")
         )
 
-    # Fallback: if strict verification rejected everything, try a plain
-    # web-search query against LinkedIn profile URLs. This rescues cases
-    # like morphllm.com where Exa's people index doesn't have the founder
-    # linked to the canonical company entity yet, but their LinkedIn
-    # profile clearly shows them as founder at that company.
-    if not matches:
+    # Fallback: plain web-search against LinkedIn profile URLs. Runs
+    # ONLY when Stage 1 didn't resolve a canonical company entity for
+    # this domain (i.e., the company is too new / not yet indexed).
+    #
+    # If Stage 1 *did* find a canonical entity but no people linked to
+    # it, the fallback would be guessing — name-based LinkedIn matching
+    # cannot disambiguate "Bagel" (bagel.com tech startup) from
+    # "Bagel App" / "Bagel Inc" / etc. that may happen to be on
+    # LinkedIn. Honest empty > wrong founders. The previous version
+    # tried to fall back here and shipped wrong-company founders.
+    if not matches and not canonical_id and not canonical_name:
         matches = _search_fallback(client, domain, company)
         if matches:
             result.notes.append("exa-fallback-used")

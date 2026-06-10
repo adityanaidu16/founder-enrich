@@ -15,8 +15,8 @@ OPTIONS = {
         "CFBundleName": "FounderEnrich",
         "CFBundleDisplayName": "FounderEnrich",
         "CFBundleIdentifier": "com.tokentape.founderenrich",
-        "CFBundleVersion": "0.3.5",
-        "CFBundleShortVersionString": "0.3.5",
+        "CFBundleVersion": "0.3.6",
+        "CFBundleShortVersionString": "0.3.6",
         "LSUIElement": True,  # menu bar only, no Dock icon
         "NSHighResolutionCapable": True,
     },
