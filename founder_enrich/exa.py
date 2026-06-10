@@ -1,22 +1,32 @@
 """Exa People Search source — uses Exa's 1B-profile people index.
 
-Single sync call per company via /search with category="people". Each result
-includes structured person entities with work history, which we verify
-client-side against the target company. Replaces the parser's noisier
-heuristics with index-grounded matches.
+Two-stage pattern per company:
 
-Why People Search over Websets:
-  - Synchronous: one call, no polling, ~1-2s per company vs 10-60s.
-  - Cheaper per company (~$0.007 vs ~$0.02-0.05 in Websets pricing).
-  - Returns structured entities (work history, role) for free.
-  - Verification is client-side and explicit ("did this person work at
-    the target company?") instead of relying on Websets' opaque rules.
+  Stage 1: category="company" search for the DOMAIN. Picks the org result
+           whose URL matches the target domain; extracts its canonical
+           Exa entity ID (e.g. "https://exa.ai/library/organization/xyz").
+           This pins down the *exact* company the user means, not just
+           "anyone named Bagel" — bagel.com (Bagel Labs at canonical ID
+           87skq0yw0by) is distinguished from same-name companies like
+           Einstein Bros Bagels or that other "Bagel Labs" with a
+           different canonical ID.
+
+  Stage 2: category="people" search for founders, then verify each
+           result by checking that one of their work_history entries
+           has a `company.id` matching Stage 1's canonical ID. Exact-ID
+           match — not name match — kills the entire false-positive
+           class where Exa's semantic search pulls in founders of
+           similarly-named companies.
+
+Falls back to name+domain word-boundary verification when Stage 1 can't
+resolve a canonical ID (rare — new/unindexed startups).
 """
 from __future__ import annotations
 
 import logging
 import re
 from typing import List, Optional
+from urllib.parse import urlparse
 
 from founder_enrich.discover import DiscoveryResult, Founder
 
@@ -46,16 +56,25 @@ def discover(domain: str, company: str, api_key: Optional[str]) -> DiscoveryResu
         return result
 
     client = Exa(api_key=api_key)
-    query = f"founder co-founder {company}"
 
+    # Stage 1: resolve the target company's canonical Exa entity from
+    # the domain. We use both the ID (strongest match) and the name
+    # (handles cases where Exa has multiple IDs for the same canonical
+    # company). If this fails entirely, fall through to name-based
+    # verification using the user's input company name.
+    canonical_id, canonical_name = _canonical_company(client, domain)
+    if canonical_id or canonical_name:
+        result.notes.append(
+            f"exa-canonical:{(canonical_id or '').rsplit('/', 1)[-1] or 'no-id'}/"
+            f"{(canonical_name or 'no-name')}"
+        )
+    else:
+        result.notes.append("exa-canonical:none")
+
+    # Stage 2: find candidate people.
     try:
-        # Plain search (not search_and_contents) — we only need the people
-        # entities + title/url. Fetching full page text for every result
-        # adds ~10-30s per call without improving extraction quality.
-        # num_results capped low: we sort + filter client-side, more results
-        # just means more verify work for no upside.
         response = client.search(
-            query=query,
+            query=f"founder co-founder {company}",
             category="people",
             type="auto",
             num_results=10,
@@ -70,12 +89,9 @@ def discover(domain: str, company: str, api_key: Optional[str]) -> DiscoveryResu
         name = _extract_name(r)
         if not name:
             continue
-        role = _extract_role(r)
-        if not _verifies_at_company(r, company, domain):
-            # Person exists in Exa's index but their work history doesn't
-            # mention the target company — likely a false match from a
-            # similarly-named org or a fuzzy semantic hit.
+        if not _verifies(r, canonical_id, canonical_name, company, domain):
             continue
+        role = _extract_role(r)
         matches.append(
             Founder(name=name, role=role or "founder", source=f"exa:{_safe_id(r)}")
         )
@@ -88,6 +104,124 @@ def discover(domain: str, company: str, api_key: Optional[str]) -> DiscoveryResu
         matches.sort(key=lambda f: 0 if "founder" in f.role.lower() else 1)
         result.founders = matches
     return result
+
+
+# ---------- Stage 1: canonical company ID lookup ----------
+
+
+def _canonical_company(client, domain: str):
+    """Find the Exa canonical organization for the company at `domain`.
+    Returns (id, name) tuple — either may be None if not found. The URL
+    host must match the target domain to avoid picking a same-named
+    competitor."""
+    domain_lc = (domain or "").lower().strip()
+    if not domain_lc:
+        return None, None
+    try:
+        resp = client.search(
+            query=domain_lc,
+            category="company",
+            type="auto",
+            num_results=5,
+        )
+    except Exception:
+        return None, None
+
+    for r in getattr(resp, "results", None) or []:
+        url = (getattr(r, "url", "") or "").lower()
+        if not url:
+            continue
+        host = urlparse(url).netloc.replace("www.", "")
+        if host == domain_lc or host.endswith("." + domain_lc):
+            for e in (getattr(r, "entities", None) or []):
+                eid = getattr(e, "id", None)
+                ename = getattr(getattr(e, "properties", None), "name", None)
+                if eid or ename:
+                    return eid, ename
+    return None, None
+
+
+# ---------- Stage 2: per-person verification ----------
+
+
+def _verifies(
+    item, canonical_id: Optional[str], canonical_name: Optional[str],
+    company: str, domain: str,
+) -> bool:
+    """Layered verification, strongest signal first:
+      1. Canonical ID exact match on work_history.company.id  → accept
+      2. Canonical NAME prefix-match on work_history.company.name → accept
+         (handles same-canonical-company with duplicate Exa IDs)
+      3. Fallback to user-input name+domain word-boundary match
+         (only when Stage 1 found nothing for the domain)"""
+    history = _work_history(item)
+
+    # 1. Strongest: canonical ID match.
+    if canonical_id and history:
+        for entry in history:
+            ref = getattr(entry, "company", None)
+            ref_id = getattr(ref, "id", None) if ref else None
+            if ref_id and ref_id == canonical_id:
+                return True
+
+    # 2. Canonical name match. Use prefix-match so "Bagel Labs" canonical
+    # matches "Bagel Labs", "Bagel Labs Inc", "Bagel Labs, Inc." — but
+    # NOT "Bagel AI" (different company name = different company).
+    if canonical_name and history:
+        canon_lc = canonical_name.lower().strip()
+        for entry in history:
+            ref = getattr(entry, "company", None)
+            name = getattr(ref, "name", None) if ref else None
+            if name and str(name).lower().strip().startswith(canon_lc):
+                return True
+
+    # 3. If Stage 1 resolved a canonical company at all, we should NOT
+    # accept on weaker signals — the company exists in Exa but this
+    # person's work history doesn't link to it. Likely a same-name
+    # founder elsewhere (e.g. Bagel AI vs Bagel Labs).
+    if canonical_id or canonical_name:
+        return False
+
+    # 4. No canonical company found (new/stealth domain). Fall back to
+    # word-boundary match against the user's input company name.
+    return _verifies_by_name(item, company, domain)
+
+
+def _verifies_by_name(item, company: str, domain: str) -> bool:
+    """Fallback when no canonical ID. Word-boundary match against
+    work_history.company.name + title."""
+    company_lc = (company or "").lower().strip()
+    domain_root = (domain or "").lower().split(".")[0]
+    patterns = []
+    for needle in {company_lc, domain_root}:
+        if needle and len(needle) >= 2:
+            patterns.append(re.compile(r"\b" + re.escape(needle) + r"\b", re.IGNORECASE))
+    if not patterns:
+        return False
+
+    history = _work_history(item)
+    if history:
+        for entry in history:
+            company_ref = getattr(entry, "company", None) or _walk(entry, ("company",))
+            name = getattr(company_ref, "name", None) or _walk(company_ref, ("name",))
+            if name and any(p.search(str(name)) for p in patterns):
+                return True
+        return False  # structured present but no match → reject
+
+    # No structured work history → trust ranking.
+    return True
+
+
+def _work_history(item):
+    """Return the work_history list (sequence of pydantic models) from
+    a search result, or None."""
+    entities = getattr(item, "entities", None) or []
+    if not entities:
+        return None
+    props = getattr(entities[0], "properties", None)
+    if props is None:
+        return None
+    return getattr(props, "work_history", None)
 
 
 # ---------- defensive entity extraction ----------
