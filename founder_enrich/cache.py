@@ -37,7 +37,11 @@ TTL_SECONDS = 30 * 24 * 3600
 #       cases (Cinch / cinchdb.dev) were returning founders of unrelated
 #       same-name companies via the fallback. Strict-only now: every
 #       returned founder is canonical-ID/name verified.
-SCHEMA_VERSION = 4
+#   v5: v0.3.8 — canonical-name prefix-match also removed. It accepted
+#       Gioya Willems at vigio.io because her work_history listed
+#       "VIGIO productions" (id=None) and startswith("Vigio") matched.
+#       Exact canonical-ID match only.
+SCHEMA_VERSION = 5
 
 
 def _db_path() -> str:

@@ -184,37 +184,25 @@ def _verifies(
     item, canonical_id: Optional[str], canonical_name: Optional[str],
     company: str, domain: str,
 ) -> bool:
-    """Strict verification: only accept if the person's work_history links
-    to the canonical company entity (by ID or by canonical name prefix).
+    """Strict verification: accept only if the person's work_history has
+    an entry whose company.id exactly matches the Stage 1 canonical ID.
 
-    No name-based fallback. When Stage 1 returned no canonical (Cinch
-    case — Exa doesn't have cinchdb.dev), we cannot disambiguate which
-    'Cinch' a candidate works at, so we reject. Empty > wrong founders
-    of a same-named different company."""
+    No name-based path. The previous canonical-name prefix-match looked
+    safe ('Bagel Labs' canonical should only match 'Bagel Labs Inc' /
+    'Bagel Labs, Inc.', not 'Bagel AI'), but in practice Exa's people
+    index has many work_history entries with company.id=None and short
+    canonical names like 'Vigio' false-match on 'VIGIO productions',
+    'VIGIO LLC', etc. The id field is the only reliable anchor."""
+    if not canonical_id:
+        return False
     history = _work_history(item)
     if not history:
         return False
-
-    # 1. Strongest: canonical ID exact match.
-    if canonical_id:
-        for entry in history:
-            ref = getattr(entry, "company", None)
-            ref_id = getattr(ref, "id", None) if ref else None
-            if ref_id and ref_id == canonical_id:
-                return True
-
-    # 2. Canonical NAME prefix-match — handles Exa's duplicate-ID case
-    # where the same canonical company has multiple entity IDs. Prefix
-    # only, so "Bagel Labs" canonical matches "Bagel Labs Inc" but
-    # NOT "Bagel AI".
-    if canonical_name:
-        canon_lc = canonical_name.lower().strip()
-        for entry in history:
-            ref = getattr(entry, "company", None)
-            name = getattr(ref, "name", None) if ref else None
-            if name and str(name).lower().strip().startswith(canon_lc):
-                return True
-
+    for entry in history:
+        ref = getattr(entry, "company", None)
+        ref_id = getattr(ref, "id", None) if ref else None
+        if ref_id and ref_id == canonical_id:
+            return True
     return False
 
 
