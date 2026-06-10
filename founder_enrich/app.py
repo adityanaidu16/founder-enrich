@@ -121,7 +121,7 @@ class FounderEnrichApp(rumps.App):
                 domain_col=domain_col,
                 exa_api_key=exa_key,
                 do_smtp=not self._skip_smtp,
-                max_workers=5,
+                max_workers=3,
                 on_progress=progress,
             )
 

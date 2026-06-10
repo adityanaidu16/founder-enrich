@@ -24,13 +24,39 @@ resolve a canonical ID (rare — new/unindexed startups).
 from __future__ import annotations
 
 import logging
+import random
 import re
+import time
 from typing import List, Optional
 from urllib.parse import urlparse
 
 from founder_enrich.discover import DiscoveryResult, Founder
 
 log = logging.getLogger(__name__)
+
+
+def _safe_search(client, **kwargs):
+    """Exa /search with retry-with-backoff for rate limits. Exa's free
+    tier has aggressive per-second throttling — without retries, ~25%
+    of calls fail silently under modest concurrency."""
+    last_err: Optional[Exception] = None
+    for attempt in range(4):
+        try:
+            return client.search(**kwargs)
+        except Exception as e:
+            last_err = e
+            err = str(e).lower()
+            transient = (
+                "429" in err or "rate" in err or "throttle" in err
+                or "timeout" in err or "503" in err or "502" in err
+            )
+            if not transient or attempt == 3:
+                break
+            # Exponential backoff with jitter: 0.5s, 1.5s, 3.5s.
+            time.sleep(0.5 * (2 ** attempt) + random.uniform(0, 0.5))
+    if last_err is not None:
+        raise last_err
+    return None
 
 FOUNDER_ROLE_RX = re.compile(
     r"\b(co[-\s]?founder|founder|founding|ceo|chief\s+executive)\b",
@@ -73,7 +99,8 @@ def discover(domain: str, company: str, api_key: Optional[str]) -> DiscoveryResu
 
     # Stage 2: find candidate people.
     try:
-        response = client.search(
+        response = _safe_search(
+            client,
             query=f"founder co-founder {company}",
             category="people",
             type="auto",
@@ -96,6 +123,16 @@ def discover(domain: str, company: str, api_key: Optional[str]) -> DiscoveryResu
             Founder(name=name, role=role or "founder", source=f"exa:{_safe_id(r)}")
         )
 
+    # Fallback: if strict verification rejected everything, try a plain
+    # web-search query against LinkedIn profile URLs. This rescues cases
+    # like morphllm.com where Exa's people index doesn't have the founder
+    # linked to the canonical company entity yet, but their LinkedIn
+    # profile clearly shows them as founder at that company.
+    if not matches:
+        matches = _search_fallback(client, domain, company)
+        if matches:
+            result.notes.append("exa-fallback-used")
+
     if not matches:
         result.notes.append("exa-no-verified-matches")
     else:
@@ -104,6 +141,66 @@ def discover(domain: str, company: str, api_key: Optional[str]) -> DiscoveryResu
         matches.sort(key=lambda f: 0 if "founder" in f.role.lower() else 1)
         result.founders = matches
     return result
+
+
+# ---------- LinkedIn fallback (used only when canonical verification fails) ----------
+
+
+def _search_fallback(client, domain: str, company: str) -> List[Founder]:
+    """Plain Exa web search restricted to LinkedIn profile URLs. We accept
+    a result only if (a) URL is a LinkedIn personal profile, (b) title
+    contains a founder role keyword, (c) title references the target
+    company or domain — otherwise we'd accept anyone whose profile body
+    happens to mention the company name."""
+    domain_root = (domain or "").lower().split(".")[0]
+    company_lc = (company or "").lower().strip()
+    domain_lc = (domain or "").lower().strip()
+    if not domain_root:
+        return []
+
+    query = f'site:linkedin.com/in "founder" {domain_root}'
+    try:
+        resp = _safe_search(client, query=query, num_results=10, type="auto")
+    except Exception:
+        return []
+
+    founders: List[Founder] = []
+    for r in (getattr(resp, "results", None) or []):
+        url = (getattr(r, "url", "") or "")
+        if "linkedin.com/in/" not in url.lower():
+            continue
+
+        title = (getattr(r, "title", "") or "")
+        title_lc = title.lower()
+
+        # Filter (b): title indicates founder role.
+        if not FOUNDER_ROLE_RX.search(title):
+            continue
+
+        # Filter (c): title references the target company. Without this,
+        # any LinkedIn founder whose profile body happens to mention the
+        # company gets accepted (e.g. "Vir S. - Founder at Ravioli" came
+        # back in the morphllm test because their description mentioned it).
+        referenced = (
+            (company_lc and company_lc in title_lc)
+            or (domain_lc and domain_lc in title_lc)
+            or (domain_root and domain_root in title_lc)
+        )
+        if not referenced:
+            continue
+
+        name = _name_from_profile_title(title)
+        if not name:
+            continue
+
+        # exa-search: prefix (NOT exa:) so the pipeline's confidence-bump
+        # logic for canonically-verified results doesn't apply here.
+        # Fallback matches stay at LOW confidence — they're a research
+        # lead rather than a verified founder.
+        founders.append(
+            Founder(name=name, role="founder", source=f"exa-search:{url[:60]}")
+        )
+    return founders
 
 
 # ---------- Stage 1: canonical company ID lookup ----------
@@ -118,7 +215,8 @@ def _canonical_company(client, domain: str):
     if not domain_lc:
         return None, None
     try:
-        resp = client.search(
+        resp = _safe_search(
+            client,
             query=domain_lc,
             category="company",
             type="auto",

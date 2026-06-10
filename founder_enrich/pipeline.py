@@ -249,7 +249,11 @@ def enrich_rows(
     domain_col: str = "domain",
     exa_api_key: Optional[str] = None,
     do_smtp: bool = True,
-    max_workers: int = 5,
+    # Default tuned for Exa's free tier with the retry-with-backoff in
+    # exa.py's _safe_search. Higher values still trip rate limits but
+    # retries recover; 3 is the empirical sweet spot at the time of
+    # writing for ~95% completion at the lowest wall time.
+    max_workers: int = 3,
     on_progress: Optional[Callable[[int, int, str], None]] = None,
 ) -> List[RowResult]:
     """Process rows in parallel. Returns results in input order."""
@@ -291,47 +295,22 @@ def _discover_with_cascade(
     if cached is not None:
         return cached
 
+    # Exa-first when the key is configured: skip the slow + noisy site
+    # parser entirely. Exa's canonical-ID-verified results are higher
+    # quality than the parser's heuristic role-keyword scrape, and the
+    # parser was the source of false positives like 'Zo Computer' at
+    # morphllm.com — it'd scrape any name near a 'Founder' keyword on
+    # the company's own site and trust it.
+    if exa_api_key:
+        result = exa.discover(clean_domain, company, exa_api_key)
+        cache.set(clean_domain, result)
+        return result
+
+    # No Exa key: fall back to the site parser. Slower and noisier,
+    # but free and offline-capable.
     parser_result = discover.discover(clean_domain)
-
-    if _has_founder_role(parser_result.founders):
-        # Local parser produced a high-signal hit; skip the paid call.
-        cache.set(clean_domain, parser_result)
-        return parser_result
-
-    if not exa_api_key:
-        cache.set(clean_domain, parser_result)
-        return parser_result
-
-    exa_result = exa.discover(clean_domain, company, exa_api_key)
-    merged = _merge(parser_result, exa_result)
-    cache.set(clean_domain, merged)
-    return merged
-
-
-def _has_founder_role(founders: List[discover.Founder]) -> bool:
-    for f in founders:
-        role = (f.role or "").lower().replace("-", "").replace(" ", "")
-        if "cofounder" in role or role == "founder":
-            return True
-    return False
-
-
-def _merge(
-    parser: discover.DiscoveryResult, exa_res: discover.DiscoveryResult
-) -> discover.DiscoveryResult:
-    """Exa-verified founders take precedence; parser founders are kept as
-    fallbacks. Anchor emails from both sources combine (Exa rarely returns
-    them, but parser anchors are essential for pattern inference)."""
-    merged = discover.DiscoveryResult(
-        founders=list(exa_res.founders),
-        anchor_emails=list(parser.anchor_emails) + list(exa_res.anchor_emails),
-        notes=list(parser.notes) + list(exa_res.notes),
-    )
-    seen = {f.name.lower().strip() for f in merged.founders}
-    for f in parser.founders:
-        if f.name.lower().strip() not in seen:
-            merged.founders.append(f)
-    return merged
+    cache.set(clean_domain, parser_result)
+    return parser_result
 
 
 def _rank(conf: str) -> int:

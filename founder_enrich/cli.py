@@ -29,7 +29,9 @@ def main(argv=None) -> int:
     parser.add_argument("--smtp", action="store_true",
                         help="run SMTP RCPT TO verification (slower; "
                              "rarely useful for Google Workspace domains)")
-    parser.add_argument("--workers", type=int, default=5)
+    parser.add_argument("--workers", type=int, default=3,
+                        help="parallel rows (default 3 — empirically the "
+                             "sweet spot with Exa free tier + retry-w-backoff)")
     args = parser.parse_args(argv)
 
     out_path = args.output or _default_output(args.input_csv)

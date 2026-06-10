@@ -1,2 +1,2 @@
 """Find founder emails for a CSV of companies + domains."""
-__version__ = "0.3.2"
+__version__ = "0.3.3"
